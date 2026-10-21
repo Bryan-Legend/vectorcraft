@@ -2,6 +2,9 @@
 //! place, one with unsaved changes asks first, and VectorCraft's own saves are never taken for
 //! another app's changes.
 
+// The watcher is desktop only (`crate::file_watch`).
+#![cfg(not(target_arch = "wasm32"))]
+
 use std::path::PathBuf;
 
 use serde_json::{Value, json};
@@ -233,5 +236,47 @@ fn a_half_written_svg_waits_for_the_whole_file() {
     write_elsewhere(&file, svg(4));
     w.set(vec![Watched { doc: 1, path: file.clone(), known: crate::file_watch::Stamp::at(&file), version: 1 }]);
     assert!(looks(&mut w).is_empty());
+    let _ = std::fs::remove_dir_all(d);
+}
+
+/// A version whose metadata alone changed (rewritten with the same bytes, `touch`, `chmod`, a sync
+/// tool's extended attributes) is not a change: only one whose contents differ is found.
+#[test]
+fn a_change_of_metadata_alone_is_not_a_change() {
+    let d = dir("meta");
+    let file = path(&d, "art.svg");
+    std::fs::write(&file, svg(1)).unwrap();
+    let mut w = Watcher::default();
+    w.set(vec![Watched { doc: 1, path: file.clone(), known: crate::file_watch::Stamp::at(&file), version: 0 }]);
+    let looks = |w: &mut Watcher| (0..3).flat_map(|_| w.tick().0).collect::<Vec<_>>();
+    assert!(looks(&mut w).is_empty());
+    // The same bytes written again, and a new modification time alone.
+    write_elsewhere(&file, svg(1));
+    assert!(looks(&mut w).is_empty(), "rewritten with the same bytes");
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+    std::fs::File::options().write(true).open(&file).unwrap().set_modified(later).unwrap();
+    assert!(looks(&mut w).is_empty(), "touched");
+    write_elsewhere(&file, svg(2));
+    assert_eq!(looks(&mut w).len(), 1, "new contents");
+    let _ = std::fs::remove_dir_all(d);
+}
+
+/// In the app: a clean document whose file is rewritten with the same bytes stays as it is, its
+/// history and selection with it.
+#[test]
+fn a_file_rewritten_with_the_same_bytes_doesnt_reload() {
+    let d = dir("samebytes");
+    let file = path(&d, "art.svg");
+    std::fs::write(&file, svg(2)).unwrap();
+    let mut app = app_with(&file);
+    app.run("select.all", json!({})).unwrap();
+    let revision = app.session.doc().unwrap().revision;
+    write_elsewhere(&file, svg(2));
+    frames(&mut app);
+    frames(&mut app);
+    assert!(app.ui.status.is_empty() && !asking(&app), "{}", app.ui.status);
+    let st = app.session.doc().unwrap();
+    assert_eq!(st.revision, revision, "not replaced");
+    assert!(!st.selection.is_empty());
     let _ = std::fs::remove_dir_all(d);
 }

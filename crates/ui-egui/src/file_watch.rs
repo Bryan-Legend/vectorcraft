@@ -9,7 +9,10 @@
 //! a whole file does: its last KiB is read first, so a file still being written costs one small
 //! read. The new bytes go to the UI thread, which is woken for them: a document without unsaved
 //! changes is reloaded in place (same tab and view, history cleared, as File › Revert does); one
-//! with unsaved changes asks first, when it is in front, and Cancel keeps them.
+//! with unsaved changes asks first, when it is in front, and Cancel keeps them. A version whose
+//! contents are the same as before (only its metadata changed: `touch`, `chmod`, a sync or backup
+//! tool's extended attributes) isn't a change: the watcher keeps a hash of the contents, taken
+//! once when it starts watching a version VectorCraft read or wrote.
 //!
 //! VectorCraft's own saves move the document's [`file_version`](vectorcraft_engine::DocState::file_version)
 //! on: the file is then stamped as it is, so they never reload, and a version the watcher found
@@ -100,6 +103,11 @@ struct Entry {
     known: Option<Stamp>,
     /// A changed version seen once, waiting to be seen unchanged again.
     pending: Option<Stamp>,
+    /// A hash of the contents last read: of the version VectorCraft read or wrote, then of each
+    /// new version found. `None`: not read yet, or couldn't be.
+    content: Option<u64>,
+    /// The version VectorCraft read or wrote was looked at for `content` (read, or found unreadable).
+    baseline: bool,
 }
 
 /// Looks at the watched files: on the worker thread, or on the UI thread in tests.
@@ -117,10 +125,13 @@ impl Watcher {
         self.files = list
             .into_iter()
             .map(|w| {
-                let prev = old.iter().find(|e| e.doc == w.doc && e.path == w.path && e.version == w.version);
+                // A version the UI thread knows is read again for `content`.
+                let prev = old.iter().find(|e| e.doc == w.doc && e.path == w.path && e.version == w.version).filter(|_| w.known.is_none());
                 Entry {
                     known: w.known.or(prev.and_then(|e| e.known)),
-                    pending: prev.and_then(|e| e.pending).filter(|_| w.known.is_none()),
+                    pending: prev.and_then(|e| e.pending),
+                    content: prev.and_then(|e| e.content),
+                    baseline: prev.is_some_and(|e| e.baseline),
                     doc: w.doc,
                     path: w.path,
                     version: w.version,
@@ -143,6 +154,15 @@ impl Watcher {
             let known = *e.known.get_or_insert(now);
             if now == known {
                 e.pending = None;
+                // Hash the version VectorCraft has, once, so that a later change of its metadata
+                // alone can be told apart from a change of its contents.
+                if !e.baseline {
+                    match read_whole(&e.path, now, false) {
+                        Version::Ready(bytes) => (e.content, e.baseline) = (Some(hash(&bytes)), true),
+                        Version::Incomplete => e.baseline = true,
+                        Version::Busy => {}
+                    }
+                }
                 continue;
             }
             if e.pending != Some(now) {
@@ -152,9 +172,15 @@ impl Watcher {
                 continue;
             }
             e.pending = None;
-            match read_whole(&e.path, now) {
+            match read_whole(&e.path, now, true) {
                 Version::Ready(bytes) => {
-                    e.known = Some(now);
+                    (e.known, e.baseline) = (Some(now), true);
+                    // Only its metadata changed: the same contents as the version before.
+                    let content = hash(&bytes);
+                    if e.content == Some(content) {
+                        continue;
+                    }
+                    e.content = Some(content);
                     found.push(Changed { doc: e.doc, path: e.path.clone(), version: e.version, stamp: now, bytes });
                 }
                 // Not a whole file in this version (a writer that failed or paused): wait for the
@@ -189,9 +215,18 @@ fn ending(path: &str) -> Option<&'static [u8]> {
     }
 }
 
-/// Read `path` if it is still the version `stamp` and, for SVG and PDF, ends as a whole file does
-/// (its last KiB read first). The whole file is then read into a buffer of exactly its size.
-fn read_whole(path: &str, stamp: Stamp) -> Version {
+/// A hash of a file's contents, to tell a version whose metadata alone changed.
+fn hash(bytes: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h);
+    h.finish()
+}
+
+/// Read `path` if it is still the version `stamp` and, with `whole`, for SVG and PDF, ends as a
+/// whole file does (its last KiB read first). The whole file is then read into a buffer of exactly
+/// its size.
+fn read_whole(path: &str, stamp: Stamp, whole: bool) -> Version {
     // Windows refuses to open a file its writer holds exclusively: not ready yet.
     let Ok(mut file) = File::open(path) else { return Version::Busy };
     let Ok(meta) = file.metadata() else { return Version::Busy };
@@ -199,7 +234,7 @@ fn read_whole(path: &str, stamp: Stamp) -> Version {
         return Version::Busy;
     }
     let len = meta.len();
-    if let Some(ending) = ending(path) {
+    if whole && let Some(ending) = ending(path) {
         let mut end = [0u8; TAIL];
         let tail = usize::try_from(len).map_or(TAIL, |l| l.min(TAIL));
         let (Some(end), Ok(back)) = (end.get_mut(..tail), i64::try_from(tail)) else { return Version::Incomplete };
